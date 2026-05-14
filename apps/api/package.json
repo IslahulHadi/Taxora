@@ -7,7 +7,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest --run",
-    "dev": "tsx watch src/main.ts",
+    "dev": "tsx --tsconfig tsconfig.json watch src/main.ts",
     "start": "node dist/main.js",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",

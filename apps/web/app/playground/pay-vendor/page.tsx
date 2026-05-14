@@ -17,6 +17,7 @@ import {
   CardBody,
   CardHeader,
   Input,
+  NumberInput,
   Label,
   Select,
   StatRow,
@@ -76,7 +77,7 @@ export default function PayVendorPage() {
           <CardBody className="space-y-4">
             <div>
               <Label hint="rupiah, tanpa titik">Jumlah bruto</Label>
-              <Input
+              <NumberInput
                 type="text"
                 inputMode="numeric"
                 value={form.amountBruto}

@@ -40,6 +40,20 @@ export function PageShell({
               GitHub
             </a>
           </nav>
+          <div className="flex gap-2">
+            <Link
+              href="/login"
+              className="rounded-md px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+            >
+              Masuk
+            </Link>
+            <Link
+              href="/signup"
+              className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
+            >
+              Daftar
+            </Link>
+          </div>
         </div>
       </header>
 

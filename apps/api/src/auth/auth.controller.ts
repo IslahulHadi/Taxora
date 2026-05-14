@@ -56,6 +56,19 @@ export class AuthDevController {
       );
     }
     const userId = body.userId ?? deterministicUuid(`dev-user::${tenant.slug}`);
+
+    // Ensure the dev user exists in the `users` table so FK constraints
+    // (e.g. journals.posted_by) are satisfied. Idempotent.
+    await this.prisma.user.upsert({
+      where: { id: userId },
+      update: {},
+      create: {
+        id: userId,
+        email: `dev@${tenant.slug}.local`,
+        fullName: `Dev User (${tenant.slug})`,
+      },
+    });
+
     const accessToken = await this.jwt.sign({
       sub: userId,
       tnt: tenant.id,

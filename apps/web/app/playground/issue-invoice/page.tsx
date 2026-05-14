@@ -17,6 +17,7 @@ import {
   CardBody,
   CardHeader,
   Input,
+  NumberInput,
   Label,
   Select,
   StatRow,
@@ -63,7 +64,7 @@ export default function IssueInvoicePage() {
           <CardBody className="space-y-4">
             <div>
               <Label hint="rupiah, tanpa titik">Subtotal</Label>
-              <Input
+              <NumberInput
                 type="text"
                 inputMode="numeric"
                 value={form.subtotal}
