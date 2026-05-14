@@ -23,7 +23,22 @@ UMKM, startups, SMBs, accounting firms (Kantor Jasa Akuntan), payroll providers,
 
 ## Status
 
-`pre-MVP` — architecture and skeleton phase. See [`docs/`](./docs) for the full design.
+`pre-MVP` — architecture and skeleton phase.
+
+**You can already run it:**
+
+```bash
+pnpm install
+pnpm --filter @taxora/web dev
+# open http://localhost:3000
+```
+
+The web playground is a real, working preview of the engine — every number you see comes from the same code that will run in production. Try the two flagship flows:
+
+- **/playground/pay-vendor** — Bayar Vendor + Potong PPh 23 (the canonical konsultan-pajak headache, automated)
+- **/playground/issue-invoice** — Faktur Pajak Keluaran (PPN normal vs DPP nilai lain vs non-PPN)
+
+See [`docs/`](./docs) for the full design.
 
 ## Documentation index
 
@@ -55,12 +70,13 @@ UMKM, startups, SMBs, accounting firms (Kantor Jasa Akuntan), payroll providers,
 
 ```
 apps/
-  web/            Next.js frontend (tenant portal)
+  web/            Next.js frontend (tenant portal + live engine playground)
   api/            NestJS backend (modular monolith)
 packages/
   contracts/     Shared DTOs / Zod schemas / OpenAPI types
   tax-rules/     Pure functions for Indonesian tax math (testable in isolation)
   accounting/    Pure double-entry primitives
+  rule-engine/   Template evaluator (TransactionTemplate -> balanced journal)
 docs/             Architecture & design documents
 docker-compose.yml
 turbo.json
