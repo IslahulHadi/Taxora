@@ -1,0 +1,598 @@
+// Taxora — canonical Prisma schema.
+// Companion to docs/03-database.md. Every business table is tenant-scoped
+// and protected by Postgres RLS (created in the SQL migration alongside this).
+//
+// Conventions:
+//  - All ids are uuid (Postgres default gen_random_uuid()).
+//  - Money is `Decimal @db.Decimal(20, 4)`. NEVER `Float`.
+//  - Statuses are `String` with CHECK constraints in SQL — Postgres enums are hard to migrate.
+//  - Timestamps default to now() and are `timestamptz`.
+//  - Soft-delete via `deletedAt` only where allowed (NEVER on journals/audit/tax artifacts).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto, citext, pg_trgm]
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  IAM
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model Tenant {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug                  String   @unique @db.Citext
+  legalName             String   @map("legal_name")
+  npwp                  String?  @db.VarChar(20)
+  pkpStatus             String   @default("NON_PKP") @map("pkp_status")
+  pphFinalUmkm          Boolean  @default(false) @map("pph_final_umkm")
+  fiscalYearStartMonth  Int      @default(1)      @map("fiscal_year_start_month") @db.SmallInt
+  baseCurrency          String   @default("IDR")  @map("base_currency") @db.Char(3)
+  tier                  String   @default("standard")
+  settings              Json     @default("{}")
+  createdAt             DateTime @default(now())  @map("created_at") @db.Timestamptz
+  deletedAt             DateTime? @map("deleted_at") @db.Timestamptz
+
+  memberships          TenantMembership[]
+  workspaces           WorkspaceTenant[]
+  accounts             Account[]
+  fiscalPeriods        FiscalPeriod[]
+  journals             Journal[]
+  journalLines         JournalLine[]
+  parties              Party[]
+  invoices             Invoice[]
+  invoiceLines         InvoiceLine[]
+  fakturPajak          FakturPajak[]
+  bills                Bill[]
+  withholdings         Withholding[]
+  taxRules             TaxRule[]
+  taxReturns           TaxReturn[]
+  payrollRuns          PayrollRun[]
+  outboxEvents         OutboxEvent[]
+  auditEvents          AuditEvent[]
+  aiDocuments          AiDocument[]
+  aiSuggestions        AiSuggestion[]
+  complianceDeadlines  ComplianceDeadline[]
+  transactionTemplates TransactionTemplate[]
+
+  @@map("tenants")
+}
+
+model User {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String   @unique @db.Citext
+  passwordHash  String?  @map("password_hash")
+  fullName      String   @map("full_name")
+  status        String   @default("active")
+  mfaEnabled    Boolean  @default(false) @map("mfa_enabled")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  memberships    TenantMembership[]
+  ownedWorkspaces Workspace[]      @relation("WorkspaceOwner")
+  postedJournals Journal[]         @relation("JournalPostedBy")
+  closedPeriods  FiscalPeriod[]    @relation("FiscalPeriodClosedBy")
+  reviewedAi     AiSuggestion[]    @relation("AiReviewedBy")
+
+  @@map("users")
+}
+
+model TenantMembership {
+  tenantId    String   @map("tenant_id") @db.Uuid
+  userId      String   @map("user_id")   @db.Uuid
+  role        String
+  permissions Json     @default("[]")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId],   references: [id], onDelete: Cascade)
+
+  @@id([tenantId, userId])
+  @@map("tenant_memberships")
+}
+
+model Workspace {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String
+  ownerUserId  String   @map("owner_user_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  owner   User              @relation("WorkspaceOwner", fields: [ownerUserId], references: [id])
+  tenants WorkspaceTenant[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceTenant {
+  workspaceId String @map("workspace_id") @db.Uuid
+  tenantId    String @map("tenant_id")    @db.Uuid
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  tenant    Tenant    @relation(fields: [tenantId],    references: [id], onDelete: Cascade)
+
+  @@id([workspaceId, tenantId])
+  @@map("workspace_tenants")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Accounting core
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model Account {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  code         String
+  name         String
+  type         String
+  normalSide   String   @map("normal_side")
+  parentId     String?  @map("parent_id") @db.Uuid
+  isTaxAccount Boolean  @default(false) @map("is_tax_account")
+  taxPurpose   String?  @map("tax_purpose")
+  isActive     Boolean  @default(true)  @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id])
+  parent       Account?      @relation("AccountTree", fields: [parentId], references: [id])
+  children     Account[]     @relation("AccountTree")
+  journalLines JournalLine[]
+  invoiceLines InvoiceLine[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, taxPurpose])
+  @@map("accounts")
+}
+
+model FiscalPeriod {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  year      Int      @db.SmallInt
+  month     Int      @db.SmallInt
+  status    String   @default("OPEN")
+  closedAt  DateTime? @map("closed_at") @db.Timestamptz
+  closedBy  String?  @map("closed_by") @db.Uuid
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  closedByUser User? @relation("FiscalPeriodClosedBy", fields: [closedBy], references: [id])
+  journals  Journal[]
+
+  @@unique([tenantId, year, month])
+  @@map("fiscal_periods")
+}
+
+model Journal {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId             String   @map("tenant_id") @db.Uuid
+  fiscalPeriodId       String   @map("fiscal_period_id") @db.Uuid
+  postedAt             DateTime @map("posted_at") @db.Timestamptz
+  referenceType        String   @map("reference_type")
+  referenceId          String?  @map("reference_id") @db.Uuid
+  memo                 String?
+  postedBy             String?  @map("posted_by") @db.Uuid
+  reversedByJournalId  String?  @map("reversed_by_journal_id") @db.Uuid
+  status               String   @default("POSTED")
+  templateCode         String?  @map("template_code")
+  templateVersion      Int?     @map("template_version")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant       Tenant         @relation(fields: [tenantId], references: [id])
+  fiscalPeriod FiscalPeriod   @relation(fields: [fiscalPeriodId], references: [id])
+  postedByUser User?          @relation("JournalPostedBy", fields: [postedBy], references: [id])
+  reversedBy   Journal?       @relation("JournalReversal", fields: [reversedByJournalId], references: [id])
+  reverses     Journal[]      @relation("JournalReversal")
+  lines        JournalLine[]
+  invoice      Invoice?       @relation("InvoicePostedJournal")
+  bill         Bill?          @relation("BillPostedJournal")
+
+  @@index([tenantId, fiscalPeriodId])
+  @@index([tenantId, referenceType, referenceId])
+  @@map("journals")
+}
+
+model JournalLine {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  journalId       String   @map("journal_id") @db.Uuid
+  accountId       String   @map("account_id") @db.Uuid
+  side            String
+  amount          Decimal  @db.Decimal(20, 4)
+  currency        String   @default("IDR") @db.Char(3)
+  fxRate          Decimal  @default(1) @map("fx_rate") @db.Decimal(20, 8)
+  description     String?
+  taxArtifactType String?  @map("tax_artifact_type")
+  taxArtifactId   String?  @map("tax_artifact_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id])
+  journal Journal @relation(fields: [journalId], references: [id], onDelete: Restrict)
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@index([tenantId, accountId, journalId])
+  @@index([tenantId, journalId])
+  @@map("journal_lines")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Subjects (vendor/customer/employee)
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model Party {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId          String   @map("tenant_id") @db.Uuid
+  type              String
+  legalName         String   @map("legal_name")
+  npwp              String?  @db.VarChar(20)
+  nik               String?  @db.VarChar(20)
+  isPkp             Boolean  @default(false) @map("is_pkp")
+  email             String?  @db.Citext
+  phone             String?
+  address           Json?
+  pph23DefaultRate  Decimal? @map("pph23_default_rate") @db.Decimal(5, 4)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt         DateTime? @map("deleted_at") @db.Timestamptz
+
+  tenant            Tenant    @relation(fields: [tenantId], references: [id])
+  invoicesAsCustomer Invoice[]
+  billsAsVendor     Bill[]
+
+  @@index([tenantId, type])
+  @@index([tenantId, npwp])
+  @@map("parties")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Sales side
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model Invoice {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  number          String
+  customerId      String   @map("customer_id") @db.Uuid
+  issueDate       DateTime @map("issue_date") @db.Date
+  dueDate         DateTime @map("due_date")   @db.Date
+  currency        String   @default("IDR") @db.Char(3)
+  subtotal        Decimal  @db.Decimal(20, 4)
+  ppnRate         Decimal  @default(0.12) @map("ppn_rate") @db.Decimal(5, 4)
+  ppnAmount       Decimal  @default(0)    @map("ppn_amount") @db.Decimal(20, 4)
+  total           Decimal  @db.Decimal(20, 4)
+  dpp             Decimal  @db.Decimal(20, 4)
+  dppBasis        String   @default("NORMAL") @map("dpp_basis")
+  status          String   @default("DRAFT")
+  issuedAt        DateTime? @map("issued_at") @db.Timestamptz
+  postedJournalId String?   @unique @map("posted_journal_id") @db.Uuid
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id])
+  customer      Party         @relation(fields: [customerId], references: [id])
+  postedJournal Journal?      @relation("InvoicePostedJournal", fields: [postedJournalId], references: [id])
+  lines         InvoiceLine[]
+  fakturPajak   FakturPajak[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId, customerId])
+  @@index([tenantId, status])
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id              String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String  @map("tenant_id") @db.Uuid
+  invoiceId       String  @map("invoice_id") @db.Uuid
+  description     String
+  quantity        Decimal @db.Decimal(20, 4)
+  unitPrice       Decimal @map("unit_price") @db.Decimal(20, 4)
+  amount          Decimal @db.Decimal(20, 4)
+  incomeAccountId String  @map("income_account_id") @db.Uuid
+  taxTreatment    String  @default("PPN_NORMAL") @map("tax_treatment")
+
+  tenant        Tenant  @relation(fields: [tenantId], references: [id])
+  invoice       Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  incomeAccount Account @relation(fields: [incomeAccountId], references: [id])
+
+  @@index([tenantId, invoiceId])
+  @@map("invoice_lines")
+}
+
+model FakturPajak {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  invoiceId       String?  @map("invoice_id") @db.Uuid
+  type            String
+  nomorSeri       String?  @map("nomor_seri")
+  status          String   @default("DRAFT")
+  kodeTransaksi   String   @map("kode_transaksi") @db.VarChar(2)
+  dpp             Decimal  @db.Decimal(20, 4)
+  ppn             Decimal  @db.Decimal(20, 4)
+  ppnbm           Decimal  @default(0) @db.Decimal(20, 4)
+  customerNpwp    String?  @map("customer_npwp") @db.VarChar(20)
+  customerNik     String?  @map("customer_nik")  @db.VarChar(20)
+  issuedDate      DateTime @map("issued_date") @db.Date
+  coretaxExportId String?  @map("coretax_export_id") @db.Uuid
+  rawXml          String?  @map("raw_xml")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  invoice Invoice? @relation(fields: [invoiceId], references: [id])
+
+  @@index([tenantId, type, status])
+  @@map("faktur_pajak")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Purchase side
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model Bill {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  vendorId        String   @map("vendor_id") @db.Uuid
+  number          String
+  vendorInvoiceNo String?  @map("vendor_invoice_no")
+  issueDate       DateTime @map("issue_date") @db.Date
+  dueDate         DateTime @map("due_date")   @db.Date
+  subtotal        Decimal  @db.Decimal(20, 4)
+  ppnAmount       Decimal  @default(0) @map("ppn_amount") @db.Decimal(20, 4)
+  pphWithheld     Decimal  @default(0) @map("pph_withheld") @db.Decimal(20, 4)
+  total           Decimal  @db.Decimal(20, 4)
+  status          String   @default("DRAFT")
+  postedJournalId String?  @unique @map("posted_journal_id") @db.Uuid
+
+  tenant        Tenant       @relation(fields: [tenantId], references: [id])
+  vendor        Party        @relation(fields: [vendorId], references: [id])
+  postedJournal Journal?     @relation("BillPostedJournal", fields: [postedJournalId], references: [id])
+  withholdings  Withholding[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId, vendorId])
+  @@map("bills")
+}
+
+model Withholding {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  billId          String?  @map("bill_id") @db.Uuid
+  payrollRunId    String?  @map("payroll_run_id") @db.Uuid
+  pphType         String   @map("pph_type")
+  kodeObjekPajak  String   @map("kode_objek_pajak")
+  dpp             Decimal  @db.Decimal(20, 4)
+  rate            Decimal  @db.Decimal(7, 5)
+  amount          Decimal  @db.Decimal(20, 4)
+  buktiPotongNo   String?  @map("bukti_potong_no")
+  status          String   @default("CALCULATED")
+  periodYear      Int      @map("period_year") @db.SmallInt
+  periodMonth     Int      @map("period_month") @db.SmallInt
+  issuedAt        DateTime? @map("issued_at") @db.Timestamptz
+  coretaxExportId String?   @map("coretax_export_id") @db.Uuid
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id])
+  bill       Bill?       @relation(fields: [billId], references: [id])
+  payrollRun PayrollRun? @relation(fields: [payrollRunId], references: [id])
+
+  @@index([tenantId, pphType, periodYear, periodMonth])
+  @@map("withholdings")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Payroll
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model PayrollRun {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  periodYear  Int      @map("period_year") @db.SmallInt
+  periodMonth Int      @map("period_month") @db.SmallInt
+  status      String   @default("DRAFT")
+  totalBruto  Decimal  @default(0) @map("total_bruto") @db.Decimal(20, 4)
+  totalPph21  Decimal  @default(0) @map("total_pph21") @db.Decimal(20, 4)
+  finalizedAt DateTime? @map("finalized_at") @db.Timestamptz
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id])
+  withholdings Withholding[]
+
+  @@unique([tenantId, periodYear, periodMonth])
+  @@map("payroll_runs")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Tax
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model TaxRule {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String?  @map("tenant_id") @db.Uuid // null = global default
+  code          String
+  payload       Json
+  effectiveFrom DateTime @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  sourceRef     String?  @map("source_ref")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+
+  @@index([code, effectiveFrom])
+  @@map("tax_rules")
+}
+
+model TaxReturn {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  kind        String                                                   // 'PPN_MASA'|'PPH21_MASA'|'PPH23_MASA'|'PPH4_2_MASA'|'PPH25'|'PPH_TAHUNAN_BADAN'|'PPH_TAHUNAN_OP'
+  periodYear  Int      @map("period_year") @db.SmallInt
+  periodMonth Int?     @map("period_month") @db.SmallInt              // null untuk SPT Tahunan
+  status      String   @default("DRAFT")
+  totals      Json     @default("{}")
+  finalizedAt DateTime? @map("finalized_at") @db.Timestamptz
+  exportRef   String?  @map("export_ref")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, kind, periodYear, periodMonth])
+  @@map("tax_returns")
+}
+
+model TransactionTemplate {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String?  @map("tenant_id") @db.Uuid                   // null = global default
+  code          String
+  version       Int      @default(1)
+  effectiveFrom DateTime @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  definition    Json                                                   // inputs, computations, journal, artifacts, obligations
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+
+  @@unique([code, version, tenantId])
+  @@index([code, effectiveFrom])
+  @@map("transaction_templates")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Compliance & ops
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model ComplianceDeadline {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  kind        String                                                  // 'SETOR_PPH23'|'LAPOR_SPT_PPN'|...
+  periodYear  Int      @map("period_year") @db.SmallInt
+  periodMonth Int?     @map("period_month") @db.SmallInt
+  dueDate     DateTime @map("due_date") @db.Date
+  status      String   @default("PENDING")                            // PENDING | DONE | OVERDUE
+  amount      Decimal? @db.Decimal(20, 4)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, status, dueDate])
+  @@map("compliance_deadlines")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Outbox + Audit
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model OutboxEvent {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  type         String
+  aggregateId  String   @map("aggregate_id") @db.Uuid
+  payload      Json
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  dispatchedAt DateTime? @map("dispatched_at") @db.Timestamptz
+  attempts     Int      @default(0) @db.SmallInt
+  lastError    String?  @map("last_error")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([dispatchedAt, createdAt])
+  @@map("outbox_events")
+}
+
+model AuditEvent {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      String   @map("tenant_id") @db.Uuid
+  actorUserId   String?  @map("actor_user_id") @db.Uuid
+  actorKind     String   @map("actor_kind")
+  action        String
+  resourceType  String   @map("resource_type")
+  resourceId    String?  @map("resource_id") @db.Uuid
+  before        Json?
+  after         Json?
+  ip            String?  @db.Inet
+  userAgent     String?  @map("user_agent")
+  occurredAt    DateTime @default(now()) @map("occurred_at") @db.Timestamptz
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, occurredAt])
+  @@index([tenantId, resourceType, resourceId])
+  @@map("audit_events")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  Idempotency
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model IdempotencyRecord {
+  id         String   @id                        // hash(tenantId, route, key, bodyHash)
+  tenantId   String   @map("tenant_id") @db.Uuid
+  route      String
+  responseStatus Int  @map("response_status")
+  responseBody  Json @map("response_body")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("idempotency_records")
+}
+
+//
+// ────────────────────────────────────────────────────────────────────────
+//  AI
+// ────────────────────────────────────────────────────────────────────────
+//
+
+model AiDocument {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String?  @map("tenant_id") @db.Uuid // null = global (peraturan)
+  sourceType  String   @map("source_type")
+  citation    String?
+  content     String
+  // pgvector — added by 02_ai_vector.sql which runs only if the `vector`
+  // extension is present. Prisma cannot type vector ops, so we always query
+  // embeddings via raw SQL ($queryRaw) anyway. Keeping the column out of
+  // schema.prisma avoids hard-failing migrations on environments without
+  // pgvector (e.g. tests, edge regions).
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+
+  @@map("ai_documents")
+}
+
+model AiSuggestion {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  kind          String
+  input         Json
+  output        Json
+  citations     Json?
+  model         String
+  promptVersion String   @map("prompt_version")
+  status        String   @default("PROPOSED")
+  reviewedBy    String?  @map("reviewed_by") @db.Uuid
+  reviewedAt    DateTime? @map("reviewed_at") @db.Timestamptz
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant     Tenant @relation(fields: [tenantId], references: [id])
+  reviewedByUser User? @relation("AiReviewedBy", fields: [reviewedBy], references: [id])
+
+  @@index([tenantId, kind, status])
+  @@map("ai_suggestions")
+}
