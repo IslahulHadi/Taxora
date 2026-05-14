@@ -1,0 +1,34 @@
+{
+  "name": "@taxora/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest --run",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:seed": "tsx prisma/seed.ts",
+    "db:reset": "prisma migrate reset --force",
+    "db:apply-invariants": "psql \"$DATABASE_URL\" -f prisma/sql/01_invariants.sql && psql \"$DATABASE_URL\" -f prisma/sql/02_ai_vector.sql",
+    "db:proof": "tsx scripts/proof.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "@taxora/accounting": "workspace:*",
+    "@taxora/tax-rules": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.0"
+  }
+}
